@@ -179,6 +179,16 @@ ring over NVLink, no `NET` transport, no cross-machine clocks. Absolute latency
 numbers from it mean nothing, and a deprecation warning belongs in any note that
 quotes them.
 
+**Priority, stated plainly.** The two-node link is the target environment. A
+profiler for network collectives needs a network; with a context switch as the
+transport, arrival and exit skew would be measuring the harness rather than
+anything a cluster would show — repeatable-looking structure that is not a
+signal. The single-GPU harness exists only so that profiler plumbing which does
+not depend on latency (record schema, sink, parquet, skew arithmetic) can be
+written before the cable arrives, and every latency number from it is throwaway.
+The 8 GiB card settles it independently: each rank reserves ~1.3 GiB, so 4 ranks
+leave under 400 MiB per replica for any actual workload.
+
 Possible fix worth one experiment later: **MPS**, which puts all ranks in one
 shared context so kernels can co-run. It requires the CUDA toolkit, which we
 need for `nvcc` in Step 2 anyway, so it costs nothing extra to try.
