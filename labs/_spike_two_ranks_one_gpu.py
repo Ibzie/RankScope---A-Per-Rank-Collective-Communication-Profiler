@@ -37,7 +37,7 @@ def worker(rank: int) -> None:
     dist.barrier()
 
     if rank == 0:
-        print("UNEXPECTED: two ranks initialized on cuda:0", flush=True)
+        print("RESULT: two ranks initialized on cuda:0 and completed all_reduce", flush=True)
 
     dist.destroy_process_group()
 

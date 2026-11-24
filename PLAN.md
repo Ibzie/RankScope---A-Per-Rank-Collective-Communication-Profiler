@@ -110,8 +110,8 @@ because they determine the architecture.
 
 | Step | Content | Needs hardware | Status |
 |---|---|---|---|
-| 0 | Env, GPU ground truth, two-ranks-one-GPU spike | desktop only | **in progress** |
-| 0.5 | Two-node bring-up ladder | cable + adapter | blocked |
+| 0 | Env, GPU ground truth, two-ranks-one-GPU spike | desktop only | **done** |
+| 0.5 | Two-node bring-up ladder | cable + adapter | blocked, **not on the critical path** |
 | 1 | What is a timestamp (stream truth lab) | desktop only | todo |
 | 2 | Ring all-reduce, hand-written in CUDA | desktop only | todo |
 | 3 | Profiler core + synthetic multi-rank replay | desktop only | todo |
@@ -136,7 +136,59 @@ constraint rather than assuming it.
 
 *Done when:* the lab runs clean and the spike fails for the *expected* reason.
 
+#### Step 0 findings (measured 2026-11-24)
+
+Software: torch 2.14.1+cu130, CUDA 13.0, **NCCL 2.30.7**, Python 3.12.13,
+CPU governor already `performance`.
+
+| Measurement | Result |
+|---|---|
+| `copy_` 256 MiB, read+write | **214.9 GB/s** (spec sheet says ~272) |
+| `all_reduce` world\_size=1, 4 KiB | 32.8 µs |
+| `all_reduce` world\_size=1, 64 MiB | 31.7 µs |
+
+The second number is the important one. A real all-reduce would need ~620 µs
+just to read and write that buffer at the 215 GB/s measured above, so 31.7 µs is
+**~20× faster than physically possible**: PyTorch *elides* single-rank
+collectives entirely, and this measures the Python call and nothing else.
+Consequence: **there is no usable `world_size=1` baseline.** Every baseline has
+to come from a real second rank. The 31 µs is still useful — it is the
+per-collective overhead budget our instrumentation must not exceed.
+
+**Two ranks on one GPU works** — NCCL 2.30 added it, gated behind
+`NCCL_MULTI_RANK_GPU_ENABLE=1`. Without the flag it refuses with a clear
+message; with it, 2 and 4 ranks both initialize on `cuda:0` and produce
+**correct** results. Transport is `P2P/CUMEM` (peer memory exported via CUDA IPC).
+
+| world | 4 KiB | 1 MiB | 16 MiB | bus BW at 16 MiB |
+|---|---|---|---|---|
+| 2 | 4.64 ms | 14.2 ms | 14.1 ms | 1.19 GB/s |
+| 4 | 27.6 ms | 83.5 ms | 83.8 ms | 0.30 GB/s |
+
+That is the whole story of this feature: functionally correct, brutally slow.
+Roughly 4.6 ms of *fixed* cost per collective at 2 ranks (verified with batched
+and per-op timing alike), and 100× less bandwidth than a plain `copy_`. The
+likely cause is context switching: the ranks are separate CUDA contexts on one
+device, so their kernels cannot co-run and each collective pays a switch. Each
+rank also reserves ~1.3 GiB, capping this at ~5 ranks on a 7.7 GiB card.
+
+**How to use it, and how not to.** It is a *functional* harness: real NCCL, real
+`seq` numbers, real multi-rank structure, enough to build and debug the profiler
+end to end without the cable. It is **not** representative: 4.6 ms floors, no
+ring over NVLink, no `NET` transport, no cross-machine clocks. Absolute latency
+numbers from it mean nothing, and a deprecation warning belongs in any note that
+quotes them.
+
+Possible fix worth one experiment later: **MPS**, which puts all ranks in one
+shared context so kernels can co-run. It requires the CUDA toolkit, which we
+need for `nvcc` in Step 2 anyway, so it costs nothing extra to try.
+
 ### Step 0.5 — Two-node bring-up
+
+Not on the critical path any more: the single-GPU multi-rank harness above is
+enough to build and debug Steps 1–3. This step is what makes the measurements
+*representative* — real `NET` transport, real two-machine clock skew, real
+network stragglers.
 
 Five rungs, each isolating exactly one failure mode. Do not skip a rung to save
 time; the whole point is that a failure tells you *where* you are.
@@ -209,8 +261,9 @@ crossover is measured, not asserted.
 - Back-projected host start, per the reconciliation in §3.4.
 - Arrival skew and exit skew; "last arriver in X% of collectives" summary.
 - Detector thresholds derived from the measured noise floor, not guessed.
-- Developed against **replayed synthetic multi-rank traces**, because the
-  analysis layer needs many ranks while the recorder needs real GPUs.
+- Developed against replayed synthetic multi-rank traces, *and* against live
+  2-rank / 4-rank runs on the single-GPU harness, which gives real NCCL traffic
+  with fake latencies. Synthetic traces give controlled ground truth.
 
 *Done when:* synthetic traces containing a known straggler are flagged
 correctly, and a synthetic jitter trace is *not* flagged as a straggler.
@@ -237,6 +290,9 @@ summary names it.
 | 2026-11-24 | USB adapter, not PCIe | Portable between the two machines; also lets us choose which end of the link is the fast one |
 | 2026-11-24 | torch 2.14.1 pinned via `uv.lock` | Mismatched NCCL versions across nodes hang silently |
 | 2026-11-24 | Buffers 4–32 KB on 100 Mb/s, 32–512 KB on 1 GbE | Keeps us in the latency-bound regime where skew dominates |
+| 2026-11-24 | Single-GPU multi-rank is a functional harness only | Real NCCL and correct, but 4.6 ms fixed cost per collective via P2P/CUMEM; never quote its absolute latencies |
+| 2026-11-24 | No `world_size=1` baseline | PyTorch elides it, so the numbers are Python overhead, not NCCL |
+| 2026-11-24 | Every collective-timing lab times a *batch* | Per-op timing forces a stream drain per iteration, which measures our synchronisation instead of NCCL |
 
 ## 7. Glossary
 
@@ -276,3 +332,7 @@ summary names it.
   B (adapter on laptop). Does not block anything.
 - **`rxe` is software RDMA**, so CPU cost is real and single-queue. Fine at
   1 GbE; it would not be fine at 100 GbE.
+- **Two measurement environments that must never be mixed.** The single-GPU
+  harness (4.6 ms floor) and the two-node link (sub-ms) differ by 4 orders of
+  magnitude. Any trace must record which one produced it, or a "regression" in
+  the dashboard will be a change of harness.

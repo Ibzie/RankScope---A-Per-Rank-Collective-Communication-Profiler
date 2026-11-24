@@ -19,6 +19,7 @@ Run:  uv run labs/00_hello_gpu.py
 
 from __future__ import annotations
 
+import os
 import platform
 import subprocess
 import sys
@@ -188,33 +189,53 @@ def measure_allreduce_baseline(iters: int = 20) -> list[tuple[float, float, floa
 # ---------------------------------------------------------------------------
 
 
-def probe_two_ranks_one_gpu(timeout_s: int = 180) -> tuple[bool, str, str]:
-    """Run the spike in a subprocess. Returns (constraint_held, verdict, detail).
-
-    NCCL aborts on duplicate devices, so we must not do this in-process.
-    """
+def _run_spike(extra_env: dict[str, str], timeout_s: int = 180) -> subprocess.CompletedProcess:
+    env = {**os.environ, **extra_env}
     try:
-        proc = subprocess.run(
+        return subprocess.run(
             [sys.executable, str(HERE / "_spike_two_ranks_one_gpu.py")],
             capture_output=True,
             text=True,
             timeout=timeout_s,
+            env=env,
         )
     except subprocess.TimeoutExpired:
-        return False, "TIMEOUT", "the job hung instead of aborting (also a finding)"
+        return subprocess.CompletedProcess(args=[], returncode=-1, stdout="", stderr="TIMEOUT")
 
-    combined = proc.stdout + proc.stderr
 
-    if "Duplicate GPU" in combined:
+def probe_two_ranks_one_gpu() -> tuple[str, str]:
+    """Returns (verdict, detail).
+
+    Three possible worlds, and they mean very different things:
+
+      * two ranks on one GPU is impossible        -> the plan needs a second box
+      * it works only with an opt-in env var      -> usable as a dev harness
+      * it works out of the box                   -> surprising, verify correctness
+
+    NCCL aborts rather than raising here, so every attempt runs in a subprocess.
+    """
+    default = _run_spike({})
+    if default.returncode == 0:
+        return "WORKS BY DEFAULT", "two ranks shared cuda:0 with no configuration"
+
+    combined = default.stdout + default.stderr
+    if "NCCL_MULTI_RANK_GPU_ENABLE" in combined:
+        opted_in = _run_spike({"NCCL_MULTI_RANK_GPU_ENABLE": "1"})
+        if opted_in.returncode == 0:
+            return (
+                "WORKS WITH OPT-IN",
+                "NCCL_MULTI_RANK_GPU_ENABLE=1 allows 2 ranks on one GPU (see 00b)",
+            )
+        return "OPT-IN FAILED", tail(opted_in.stdout + opted_in.stderr)
+
+    if default.returncode != 0:
         detail = next(
-            (ln.strip() for ln in combined.splitlines() if "Duplicate GPU" in ln), ""
+            (ln.strip() for ln in combined.splitlines() if "Last error" in combined.splitlines()),
+            tail(combined, 3),
         )
-        return True, "FAILED AS EXPECTED", detail
+        return "FAILED, OTHER REASON", detail
 
-    if proc.returncode != 0:
-        return False, "FAILED, WRONG REASON", tail(combined)
-
-    return False, "UNEXPECTEDLY SUCCEEDED", tail(combined)
+    return "UNEXPECTED", tail(combined)
 
 
 def cpu_governor() -> str:
@@ -257,25 +278,36 @@ def main() -> int:
     for size_mib, latency_us, algbw in measure_allreduce_baseline():
         label = f"{size_mib * 1024:.0f} KiB" if size_mib < 1 else f"{size_mib:.0f} MiB"
         print(f"  {label:>10}  {latency_us:9.1f} us  {algbw:9.1f} GB/s")
-    print("  'algo BW' = bytes / time. With one rank there is no bus to")
-    print("  divide by, so this is a floor, not a bandwidth.")
+    print("  All sizes cost the same ~31 us -- including 64 MiB. A real")
+    print("  all-reduce would need ~620 us just to read and write that buffer")
+    print("  at the 215 GB/s measured above, so the reported time is ~20x")
+    print("  faster than physically possible: PyTorch elides single-rank")
+    print("  collectives, so this measures the Python call and nothing else.")
+    print("  There is no usable world_size=1 baseline; every real number")
+    print("  needs a second rank. What this *is* good for is the")
+    print("  per-collective overhead budget our instrumentation must beat.")
 
     section("5. can two ranks share one GPU?")
-    held, verdict, detail = probe_two_ranks_one_gpu()
+    verdict, detail = probe_two_ranks_one_gpu()
     row("verdict", verdict)
     if detail:
         for line in detail.splitlines():
             row("", line)
 
     print()
-    if held:
-        print("  Confirmed: one device per rank. Real collectives need the")
+    if verdict.startswith("WORKS"):
+        print("  Multi-rank on one device is possible, so many experiments that")
+        print("  assumed a second machine can run locally. Careful: it is not")
+        print("  representative -- see the transport and latency notes in")
+        print("  PLAN.md Step 0 findings before trusting absolute numbers.")
+    elif verdict.startswith("FAILED"):
+        print("  One device per rank, as expected. Real collectives need the")
         print("  second machine (PLAN.md, Step 0.5).")
     else:
-        print("  The constraint did NOT hold as expected. Record what")
-        print("  actually happened before trusting the rest of the plan.")
+        print("  Neither outcome was expected. Record what actually happened")
+        print("  before trusting the rest of the plan.")
 
-    return 0 if held else 2
+    return 0
 
 
 if __name__ == "__main__":
